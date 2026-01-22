@@ -2694,3 +2694,197 @@ fn gather_mm_moe_realistic() {
     }
     println!("gather_mm_moe_realistic: max_diff = {}", max_diff);
 }
+
+// ==================== gather_qmm (quantized) tests ====================
+//
+// Note: Full numerical verification of gather_qmm requires Q4_K quantized data,
+// which needs the quantization utilities from candle-core. These tests verify
+// that the kernel compiles, loads, and can be dispatched without crashing.
+// Full integration tests are done at the candle-core level.
+
+/// Minimal Q4_K block structure for testing (144 bytes per 256 values)
+/// This matches the block_q4_K struct in quantized.metal
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BlockQ4K {
+    // scale and min packed as half2 (4 bytes)
+    dm: [u16; 2],
+    // 6-bit quantized scales packed into 12 bytes
+    scales: [u8; 12],
+    // 4-bit quantized values (256 values -> 128 bytes)
+    qs: [u8; 128],
+}
+
+impl Default for BlockQ4K {
+    fn default() -> Self {
+        Self {
+            dm: [0x3C00, 0x0000], // scale=1.0 in f16, min=0.0
+            scales: [0; 12],
+            qs: [0; 128], // All zeros -> dequantized to ~0
+        }
+    }
+}
+
+fn create_test_q4k_blocks(num_blocks: usize) -> Vec<BlockQ4K> {
+    // Create simple test blocks with known values
+    // Each block represents 256 quantized values
+    vec![BlockQ4K::default(); num_blocks]
+}
+
+/// Test that gather_qmm kernel loads and can be dispatched
+#[test]
+fn gather_qmm_kernel_loads() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    // Try to load all three kernel variants
+    let kernel_names: [&'static str; 3] = [
+        "gather_qmm_q4_K_simple",
+        "gather_qmm_q4_K_tiled",
+        "gather_qmm_q4_K_simd",
+    ];
+    for kernel_name in kernel_names {
+        let result = kernels.load_pipeline(&device, Source::GatherQmm, kernel_name);
+        assert!(
+            result.is_ok(),
+            "Failed to load kernel {}: {:?}",
+            kernel_name,
+            result.err()
+        );
+    }
+}
+
+/// Test gather_qmm with minimal input (smoke test)
+#[test]
+fn gather_qmm_smoke_test() {
+    // Minimal dimensions:
+    // m = 2 rows (tokens)
+    // n = 256 output features (must be multiple of Q4_K block size)
+    // k = 256 hidden dim (must be multiple of Q4_K block size)
+    // num_experts = 2
+    let (m, n, k, num_experts) = (2, 256, 256, 2);
+    let blocks_per_row = k / 256; // = 1 block per row
+
+    let device = device();
+    let kernels = Kernels::new();
+    let command_queue = device.new_command_queue().unwrap();
+    let semaphore = Arc::new(CommandSemaphore::new());
+    let command_buffer = create_command_buffer(&command_queue, semaphore).unwrap();
+
+    // Create quantized weights: [num_experts, n, k/256] blocks
+    let total_blocks = num_experts * n * blocks_per_row;
+    let q4k_blocks = create_test_q4k_blocks(total_blocks);
+    let weights_ptr = q4k_blocks.as_ptr() as *const c_void;
+    let weights_size = total_blocks * std::mem::size_of::<BlockQ4K>();
+    let weights = device
+        .new_buffer_with_data(weights_ptr, weights_size, RESOURCE_OPTIONS)
+        .unwrap();
+
+    // Create input activations: [m, k] float
+    let input_data: Vec<f32> = vec![0.1; m * k];
+    let input = new_buffer(&device, &input_data);
+
+    // Create expert indices: [m] uint32
+    let indices: Vec<u32> = vec![0, 1]; // Row 0 -> expert 0, Row 1 -> expert 1
+    let indices_buf = new_buffer(&device, &indices);
+
+    // Create output buffer: [m, n] float
+    let output = device
+        .new_buffer(m * n * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    // Run the kernel
+    call_gather_qmm(
+        &device,
+        &command_buffer,
+        &kernels,
+        GgmlDType::Q4K,
+        (m, n, k, num_experts),
+        &weights,
+        0,
+        &input,
+        0,
+        &indices_buf,
+        0,
+        &output,
+    )
+    .expect("gather_qmm kernel dispatch failed");
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    // Read output (we're mainly checking it doesn't crash)
+    let result: Vec<f32> = read_to_vec(&output, m * n);
+    assert_eq!(result.len(), m * n);
+
+    // With zero-initialized Q4_K blocks (all zeros), output should be close to zero
+    // (the exact value depends on Q4_K dequantization with scale=1, min=0)
+    println!("gather_qmm_smoke_test: output sample = {:?}", &result[..8.min(result.len())]);
+}
+
+/// Test gather_qmm with larger dimensions (stress test)
+#[test]
+fn gather_qmm_large_token_count() {
+    // This is the key test: verify we can handle >768 rows without hanging
+    // (the old kernel would overflow threadgroup memory at ~1024 rows)
+    let (m, n, k, num_experts) = (1024, 256, 256, 8);
+    let blocks_per_row = k / 256;
+
+    let device = device();
+    let kernels = Kernels::new();
+    let command_queue = device.new_command_queue().unwrap();
+    let semaphore = Arc::new(CommandSemaphore::new());
+    let command_buffer = create_command_buffer(&command_queue, semaphore).unwrap();
+
+    // Create quantized weights
+    let total_blocks = num_experts * n * blocks_per_row;
+    let q4k_blocks = create_test_q4k_blocks(total_blocks);
+    let weights_ptr = q4k_blocks.as_ptr() as *const c_void;
+    let weights_size = total_blocks * std::mem::size_of::<BlockQ4K>();
+    let weights = device
+        .new_buffer_with_data(weights_ptr, weights_size, RESOURCE_OPTIONS)
+        .unwrap();
+
+    // Create input
+    let input_data: Vec<f32> = vec![0.1; m * k];
+    let input = new_buffer(&device, &input_data);
+
+    // Create indices (randomly assign experts)
+    let mut rng = rng();
+    let indices: Vec<u32> = (0..m)
+        .map(|_| rng.random_range(0..num_experts as u32))
+        .collect();
+    let indices_buf = new_buffer(&device, &indices);
+
+    // Create output
+    let output = device
+        .new_buffer(m * n * std::mem::size_of::<f32>(), RESOURCE_OPTIONS)
+        .unwrap();
+
+    // Run kernel
+    call_gather_qmm(
+        &device,
+        &command_buffer,
+        &kernels,
+        GgmlDType::Q4K,
+        (m, n, k, num_experts),
+        &weights,
+        0,
+        &input,
+        0,
+        &indices_buf,
+        0,
+        &output,
+    )
+    .expect("gather_qmm large token count dispatch failed");
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let result: Vec<f32> = read_to_vec(&output, m * n);
+    assert_eq!(result.len(), m * n);
+    println!(
+        "gather_qmm_large_token_count: {} rows completed successfully",
+        m
+    );
+}

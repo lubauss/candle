@@ -4,6 +4,7 @@ pub const CAST: &str = include_str!("metal_src/cast.metal");
 pub const CONV: &str = include_str!("metal_src/conv.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
 pub const GATHER_MM: &str = include_str!("metal_src/gather_mm.metal");
+pub const GATHER_QMM: &str = include_str!("metal_src/gather_qmm.metal");
 pub const INDEXING: &str = include_str!("metal_src/indexing.metal");
 pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
 pub const MLX_SORT: &str = include_str!("metal_src/mlx_sort.metal");
@@ -23,6 +24,7 @@ pub enum Source {
     Conv,
     Fill,
     GatherMm,
+    GatherQmm,
     Gemm,
     Indexing,
     MlxSort,

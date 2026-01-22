@@ -4,6 +4,7 @@ pub mod cast;
 pub mod convolution;
 pub mod fill;
 pub mod gather_mm;
+pub mod gather_qmm;
 pub mod indexing;
 mod macros;
 pub mod mlx_gemm;
@@ -21,6 +22,7 @@ pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
 pub use fill::*;
 pub use gather_mm::{call_gather_mm, call_gather_mm_with_kernel, GatherMmKernel};
+pub use gather_qmm::{call_gather_qmm, call_gather_qmm_with_kernel, GatherQmmKernel};
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, GemmDType};
 pub use quantized::{

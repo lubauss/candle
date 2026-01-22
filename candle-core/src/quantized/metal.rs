@@ -582,99 +582,158 @@ impl QMetalStorage {
 
         let encoder = device.command_encoder()?;
 
-        // Prepare shapes and strides for the kernel
-        // Weight shape: [num_experts, n, k] -> pad to 4D: [1, num_experts, n, k]
-        let src0_shape_4d = vec![1, num_experts, n, k];
-        let src0_stride_4d: Vec<usize> = {
-            let type_ratio =
-                self.dtype.type_size() as f32 / self.dtype.block_size() as f32;
-            vec![
-                (num_experts * n * k) as f32 * type_ratio,
-                (n * k) as f32 * type_ratio,
-                k as f32 * type_ratio,
-                type_ratio,
-            ]
-            .iter()
-            .map(|x| *x as usize)
-            .collect()
-        };
+        // Total number of output rows (token, expert_slot pairs)
+        let total_rows = nei0 * nei1;
 
-        // Input shape for kernel: [1, num_tokens, expert_dim, k]
-        // The kernel accesses: src1 + id.y * nb12 + id.x * nb11
-        // where id.y = token_idx, id.x = expert_slot
-        //
-        // Two modes:
-        // 1. Broadcast mode (input_expert_dim == 1): nb11 = 0, all expert slots read same row
-        // 2. Normal mode (input_expert_dim == nei0): nb11 = k*sizeof(float), each reads own row
-        let src1_shape_4d = vec![1usize, num_tokens, input_expert_dim, k];
-        let src1_stride_4d: Vec<usize> = if broadcast_input {
-            vec![
-                num_tokens * k * DType::F32.size_in_bytes(), // nb13: outer batch stride
-                k * DType::F32.size_in_bytes(),              // nb12: token stride
-                0,                                            // nb11: expert slot stride = 0 (BROADCAST!)
-                DType::F32.size_in_bytes(),                  // nb10: element stride
-            ]
-        } else {
-            vec![
-                num_tokens * nei0 * k * DType::F32.size_in_bytes(), // nb13: outer batch stride
-                nei0 * k * DType::F32.size_in_bytes(),              // nb12: token stride
-                k * DType::F32.size_in_bytes(),                     // nb11: expert slot stride
-                DType::F32.size_in_bytes(),                         // nb10: element stride
-            ]
-        };
+        // Threshold for using new gather_qmm kernel vs old kernel_mul_mm_id
+        // The old kernel uses threadgroup memory: 8 experts × max_tokens × 4 bytes
+        // Metal threadgroup limit is 32KB, so max_tokens ≈ 1024 before overflow
+        // We use 768 as a safe threshold (leaves room for other threadgroup usage)
+        const MAX_ROWS_FOR_OLD_KERNEL: usize = 768;
 
-        // Output shape: [1, num_tokens, num_experts_per_tok, n]
-        // The kernel writes: dst + token_idx * nb12/4 + expert_slot * nb11/4
-        // We want output[token, expert_slot, :] to be at different locations
-        let dst_shape_4d = vec![1usize, num_tokens, nei0, n];
-        let dst_stride_4d: Vec<usize> = vec![
-            num_tokens * nei0 * n * DType::F32.size_in_bytes(), // nb13
-            nei0 * n * DType::F32.size_in_bytes(),              // nb12: token stride
-            n * DType::F32.size_in_bytes(),                     // nb11: expert slot stride
-            DType::F32.size_in_bytes(),                         // nb10: element stride
-        ];
+        // Use new gather_qmm kernel for Q4K with large token counts to avoid threadgroup overflow
+        // The new kernel stores indices in device memory (unlimited) instead of threadgroup (32KB limit)
+        let use_gather_qmm = matches!(self.dtype, GgmlDType::Q4K)
+            && total_rows > MAX_ROWS_FOR_OLD_KERNEL
+            && nei0 == 1  // Only support simple case initially (one expert per token)
+            && !broadcast_input;
 
-        candle_metal_kernels::call_quantized_matmul_mm_id_t(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            (nei0, nei1),
-            nbi1,
-            &src0_shape_4d,
-            &src0_stride_4d,
-            &self.buffer,
-            &src1_shape_4d,
-            &src1_stride_4d,
-            storage.buffer(),
-            layout.start_offset() * storage.dtype().size_in_bytes(),
-            &dst_shape_4d,
-            &dst_stride_4d,
-            0,
-            &dst,
-            ids.buffer(),
-        )
-        .map_err(MetalError::from)?;
+        if use_gather_qmm {
+            // Use new gather_qmm kernel (device memory indices, no overflow)
+            //
+            // This kernel is designed for large image inputs that generate 5000+ tokens,
+            // which would overflow the 32KB threadgroup memory limit in the old kernel.
 
-        // Profile kernel execution if enabled
-        if profiling {
-            if let Some(start) = start {
-                // Sync mode: Force GPU synchronization to get accurate timing
-                device.wait_until_completed()?;
-                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-                // Log MoE kernel with additional info
-                eprintln!(
-                    "[METAL PROFILE] MM_ID,{:?},{},{},{},{:.4}ms,experts={},nei0={},nei1={}",
-                    self.dtype, num_tokens, n, k, elapsed, num_experts, nei0, nei1
-                );
-            } else {
-                // Async mode: Just log kernel selection (sampled)
-                let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count % 100 == 0 {
+            // The gather_qmm kernel expects:
+            // - weights: [num_experts, N, K/block_size] quantized blocks
+            // - input: [M, K] float activations (M = total_rows)
+            // - indices: [M] uint32 expert indices
+            // - output: [M, N] float
+
+            // Convert i32 indices to u32 by reinterpreting the buffer
+            // The Metal kernel will read them as uint32_t
+            candle_metal_kernels::call_gather_qmm(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                (total_rows, n, k, num_experts),
+                &self.buffer,
+                0,
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                ids.buffer(),
+                ids_layout.start_offset() * std::mem::size_of::<i32>(),
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+
+            // Profile kernel execution if enabled
+            if profiling {
+                if let Some(start) = start {
+                    device.wait_until_completed()?;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
-                        "[METAL PROFILE] MM_ID,{:?},{},{},{},call#{},experts={},nei0={},nei1={}",
-                        self.dtype, num_tokens, n, k, count, num_experts, nei0, nei1
+                        "[METAL PROFILE] GATHER_QMM,{:?},{},{},{},{:.4}ms,experts={},total_rows={}",
+                        self.dtype, total_rows, n, k, elapsed, num_experts, total_rows
                     );
+                } else {
+                    let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count % 100 == 0 {
+                        eprintln!(
+                            "[METAL PROFILE] GATHER_QMM,{:?},{},{},{},call#{},experts={},total_rows={}",
+                            self.dtype, total_rows, n, k, count, num_experts, total_rows
+                        );
+                    }
+                }
+            }
+        } else {
+            // Use original kernel_mul_mm_id for small inputs or non-Q4K dtypes
+            // This kernel is well-tested and handles complex broadcast modes
+
+            // Prepare shapes and strides for the kernel
+            // Weight shape: [num_experts, n, k] -> pad to 4D: [1, num_experts, n, k]
+            let src0_shape_4d = vec![1, num_experts, n, k];
+            let src0_stride_4d: Vec<usize> = {
+                let type_ratio =
+                    self.dtype.type_size() as f32 / self.dtype.block_size() as f32;
+                vec![
+                    (num_experts * n * k) as f32 * type_ratio,
+                    (n * k) as f32 * type_ratio,
+                    k as f32 * type_ratio,
+                    type_ratio,
+                ]
+                .iter()
+                .map(|x| *x as usize)
+                .collect()
+            };
+
+            // Input shape for kernel: [1, num_tokens, expert_dim, k]
+            let src1_shape_4d = vec![1usize, num_tokens, input_expert_dim, k];
+            let src1_stride_4d: Vec<usize> = if broadcast_input {
+                vec![
+                    num_tokens * k * DType::F32.size_in_bytes(),
+                    k * DType::F32.size_in_bytes(),
+                    0,
+                    DType::F32.size_in_bytes(),
+                ]
+            } else {
+                vec![
+                    num_tokens * nei0 * k * DType::F32.size_in_bytes(),
+                    nei0 * k * DType::F32.size_in_bytes(),
+                    k * DType::F32.size_in_bytes(),
+                    DType::F32.size_in_bytes(),
+                ]
+            };
+
+            // Output shape: [1, num_tokens, num_experts_per_tok, n]
+            let dst_shape_4d = vec![1usize, num_tokens, nei0, n];
+            let dst_stride_4d: Vec<usize> = vec![
+                num_tokens * nei0 * n * DType::F32.size_in_bytes(),
+                nei0 * n * DType::F32.size_in_bytes(),
+                n * DType::F32.size_in_bytes(),
+                DType::F32.size_in_bytes(),
+            ];
+
+            candle_metal_kernels::call_quantized_matmul_mm_id_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                (nei0, nei1),
+                nbi1,
+                &src0_shape_4d,
+                &src0_stride_4d,
+                &self.buffer,
+                &src1_shape_4d,
+                &src1_stride_4d,
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                &dst_shape_4d,
+                &dst_stride_4d,
+                0,
+                &dst,
+                ids.buffer(),
+            )
+            .map_err(MetalError::from)?;
+
+            // Profile kernel execution if enabled
+            if profiling {
+                if let Some(start) = start {
+                    device.wait_until_completed()?;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "[METAL PROFILE] MM_ID,{:?},{},{},{},{:.4}ms,experts={},nei0={},nei1={}",
+                        self.dtype, num_tokens, n, k, elapsed, num_experts, nei0, nei1
+                    );
+                } else {
+                    let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count % 100 == 0 {
+                        eprintln!(
+                            "[METAL PROFILE] MM_ID,{:?},{},{},{},call#{},experts={},nei0={},nei1={}",
+                            self.dtype, num_tokens, n, k, count, num_experts, nei0, nei1
+                        );
+                    }
                 }
             }
         }
