@@ -7295,24 +7295,83 @@ kernel void kernel_mul_mm_id(
 
     device const uchar * src0 = src0s + i02*nb02;
 
-    // row indices
+    // row indices stored after the 8KB shared memory region
     threadgroup ushort2 * rowids = (threadgroup ushort2 *)(shared_memory + 8192);
 
-    // TODO: parallelize this loop
-    int64_t _ne1 = 0;
-    for (ushort ii1 = 0; ii1 < nei1; ii1++) {
-        for (ushort ii0 = 0; ii0 < nei0; ii0++) {
-            int32_t id = ((device int32_t *) (ids + ii1*nbi1))[ii0];
-            if (id == i02) {
-                //if (tiitg == 0) {
-                    rowids[_ne1] = ushort2(ii0, ii1);
-                //}
-                _ne1++;
-            }
+    // Parallel index gathering using all 128 threads in the threadgroup
+    // Each thread processes a portion of the (ii0, ii1) pairs
+    const uint total_pairs = nei0 * nei1;
+    const uint n_threads = 128; // threads_per_threadgroup
+    const uint pairs_per_thread = (total_pairs + n_threads - 1) / n_threads;
+    const uint start_pair = tiitg * pairs_per_thread;
+    const uint end_pair = min(start_pair + pairs_per_thread, total_pairs);
+
+    // Phase 1: Count matches for this thread
+    uint thread_match_count = 0;
+    for (uint pair_idx = start_pair; pair_idx < end_pair; pair_idx++) {
+        uint ii0 = pair_idx % nei0;
+        uint ii1 = pair_idx / nei0;
+        int32_t id = ((device int32_t *)(ids + ii1 * nbi1))[ii0];
+        if (id == i02) {
+            thread_match_count++;
+        }
+    }
+
+    // Phase 2: Compute write offset using parallel prefix sum across simdgroups
+    // Use threadgroup memory for simdgroup totals
+    threadgroup uint simdgroup_totals[4]; // 128 threads / 32 per simdgroup = 4 simdgroups
+    threadgroup uint simdgroup_offsets[4];
+
+    // Simdgroup-level inclusive prefix sum
+    uint lane_id = tiitg % 32;
+    uint simd_sum = simd_prefix_exclusive_sum(thread_match_count);
+    uint simd_total = simd_sum + thread_match_count;
+    simd_total = simd_broadcast(simd_total, 31); // Broadcast lane 31's inclusive sum
+
+    // Store simdgroup total
+    if (lane_id == 0) {
+        simdgroup_totals[sgitg] = simd_total;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute simdgroup offsets (done by first simdgroup)
+    if (sgitg == 0 && lane_id < 4) {
+        uint sg_offset = 0;
+        for (uint i = 0; i < lane_id; i++) {
+            sg_offset += simdgroup_totals[i];
+        }
+        simdgroup_offsets[lane_id] = sg_offset;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute this thread's global write offset
+    uint write_offset = simdgroup_offsets[sgitg] + simd_sum;
+
+    // Phase 3: Write matching pairs to rowids
+    for (uint pair_idx = start_pair; pair_idx < end_pair; pair_idx++) {
+        uint ii0 = pair_idx % nei0;
+        uint ii1 = pair_idx / nei0;
+        int32_t id = ((device int32_t *)(ids + ii1 * nbi1))[ii0];
+        if (id == i02) {
+            rowids[write_offset] = ushort2(ii0, ii1);
+            write_offset++;
+        }
+    }
+
+    // Compute total count (sum of all simdgroup totals)
+    threadgroup uint total_count;
+    if (tiitg == 0) {
+        total_count = 0;
+        for (uint i = 0; i < 4; i++) {
+            total_count += simdgroup_totals[i];
         }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int64_t _ne1 = total_count;
 
     kernel_mul_mm_id_impl<block_q, nl, dequantize_func>(
         src0,

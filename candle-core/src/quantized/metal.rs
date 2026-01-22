@@ -3,6 +3,62 @@ use crate::backend::BackendStorage;
 use crate::{DType, MetalDevice, MetalStorage, Result, Shape, D};
 use candle_metal_kernels::metal::Buffer;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Static flag to enable kernel profiling via CANDLE_METAL_PROFILE=1
+/// Set to "sync" for accurate but slow timing, or "1" for fast async logging
+static PROFILING_ENABLED: AtomicBool = AtomicBool::new(false);
+static PROFILING_SYNC: AtomicBool = AtomicBool::new(false);
+static PROFILING_CHECKED: AtomicBool = AtomicBool::new(false);
+/// Counter for kernel calls (for sampling)
+static KERNEL_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Check if profiling is enabled (cached after first check)
+fn is_profiling_enabled() -> bool {
+    if !PROFILING_CHECKED.load(Ordering::Relaxed) {
+        let profile_val = std::env::var("CANDLE_METAL_PROFILE").unwrap_or_default();
+        let enabled = !profile_val.is_empty() && profile_val != "0" && profile_val.to_lowercase() != "false";
+        let sync_mode = profile_val == "sync";
+        PROFILING_ENABLED.store(enabled, Ordering::Relaxed);
+        PROFILING_SYNC.store(sync_mode, Ordering::Relaxed);
+        PROFILING_CHECKED.store(true, Ordering::Relaxed);
+        if enabled {
+            if sync_mode {
+                eprintln!("[METAL PROFILE] Sync profiling enabled (SLOW) - accurate kernel timing");
+            } else {
+                eprintln!("[METAL PROFILE] Async profiling enabled - kernel selection logging only");
+            }
+            eprintln!("[METAL PROFILE] Format: kernel_type,dtype,batch_size,n,k,call_count");
+        }
+    }
+    PROFILING_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Check if sync (accurate timing) mode is enabled
+fn is_sync_profiling() -> bool {
+    PROFILING_SYNC.load(Ordering::Relaxed)
+}
+
+/// Log profiling data for a kernel execution (async mode - no timing)
+fn log_kernel_profile_async(kernel_type: &str, dtype: GgmlDType, batch_size: usize, n: usize, k: usize) {
+    let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Only log every 100th call to reduce noise
+    if count % 100 == 0 {
+        eprintln!(
+            "[METAL PROFILE] {},{:?},{},{},{},call#{}",
+            kernel_type, dtype, batch_size, n, k, count
+        );
+    }
+}
+
+/// Log profiling data with timing (sync mode - accurate but slow)
+fn log_kernel_profile_sync(kernel_type: &str, dtype: GgmlDType, batch_size: usize, n: usize, k: usize, time_ms: f64) {
+    let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "[METAL PROFILE] {},{:?},{},{},{},{:.4}ms,call#{}",
+        kernel_type, dtype, batch_size, n, k, time_ms, count
+    );
+}
 
 pub struct QMetalStorage {
     dtype: GgmlDType,
@@ -221,6 +277,11 @@ impl QMetalStorage {
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
+
+        let profiling = is_profiling_enabled();
+        let sync_profiling = profiling && is_sync_profiling();
+        let start = if sync_profiling { Some(std::time::Instant::now()) } else { None };
+
         let encoder = device.command_encoder()?;
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
@@ -239,8 +300,36 @@ impl QMetalStorage {
             )
             .map_err(MetalError::from)?;
         }
+
+        // Profile kernel execution if enabled
+        if profiling {
+            if let Some(start) = start {
+                // Sync mode: Force GPU synchronization to get accurate timing
+                device.wait_until_completed()?;
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                log_kernel_profile_sync("MV", self.dtype, m, n, k, elapsed);
+            } else {
+                // Async mode: Just log kernel selection
+                log_kernel_profile_async("MV", self.dtype, m, n, k);
+            }
+        }
+
         let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
+    }
+
+    /// MM vs MV kernel selection threshold.
+    /// For small batch sizes (<=4), MV kernel has lower memory pressure and is often faster.
+    /// For larger batches, MM kernel's higher compute intensity provides better performance.
+    /// This threshold can be tuned via CANDLE_METAL_MV_THRESHOLD environment variable.
+    fn get_mv_threshold() -> usize {
+        static THRESHOLD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *THRESHOLD.get_or_init(|| {
+            std::env::var("CANDLE_METAL_MV_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4) // Default: use MV for batch size <= 4
+        })
     }
 
     pub fn fwd(
@@ -271,7 +360,12 @@ impl QMetalStorage {
             )
         }
 
-        if src_shape.dim(D::Minus2)? == 1 {
+        // Improved MM vs MV kernel selection:
+        // - MV is better for small batch sizes (lower memory pressure)
+        // - MM is better for larger batches (higher compute intensity)
+        let batch_size = src_shape.dim(D::Minus2)?;
+        let mv_threshold = Self::get_mv_threshold();
+        if batch_size <= mv_threshold {
             return self.fwd_mv(self_shape, storage, layout);
         }
 
@@ -283,6 +377,11 @@ impl QMetalStorage {
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul")?;
+
+        let profiling = is_profiling_enabled();
+        let sync_profiling = profiling && is_sync_profiling();
+        let start = if sync_profiling { Some(std::time::Instant::now()) } else { None };
+
         let encoder = device.command_encoder()?;
 
         assert_eq!(storage.dtype(), DType::F32);
@@ -330,6 +429,19 @@ impl QMetalStorage {
             &dst,
         )
         .map_err(MetalError::from)?;
+
+        // Profile kernel execution if enabled
+        if profiling {
+            if let Some(start) = start {
+                // Sync mode: Force GPU synchronization to get accurate timing
+                device.wait_until_completed()?;
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                log_kernel_profile_sync("MM", self.dtype, batch_size, n, k, elapsed);
+            } else {
+                // Async mode: Just log kernel selection
+                log_kernel_profile_async("MM", self.dtype, batch_size, n, k);
+            }
+        }
 
         let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
@@ -463,6 +575,11 @@ impl QMetalStorage {
 
         let device = storage.device().clone();
         let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul_id")?;
+
+        let profiling = is_profiling_enabled();
+        let sync_profiling = profiling && is_sync_profiling();
+        let start = if sync_profiling { Some(std::time::Instant::now()) } else { None };
+
         let encoder = device.command_encoder()?;
 
         // Prepare shapes and strides for the kernel
@@ -538,6 +655,29 @@ impl QMetalStorage {
             ids.buffer(),
         )
         .map_err(MetalError::from)?;
+
+        // Profile kernel execution if enabled
+        if profiling {
+            if let Some(start) = start {
+                // Sync mode: Force GPU synchronization to get accurate timing
+                device.wait_until_completed()?;
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                // Log MoE kernel with additional info
+                eprintln!(
+                    "[METAL PROFILE] MM_ID,{:?},{},{},{},{:.4}ms,experts={},nei0={},nei1={}",
+                    self.dtype, num_tokens, n, k, elapsed, num_experts, nei0, nei1
+                );
+            } else {
+                // Async mode: Just log kernel selection (sampled)
+                let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count % 100 == 0 {
+                    eprintln!(
+                        "[METAL PROFILE] MM_ID,{:?},{},{},{},call#{},experts={},nei0={},nei1={}",
+                        self.dtype, num_tokens, n, k, count, num_experts, nei0, nei1
+                    );
+                }
+            }
+        }
 
         let dst_storage =
             crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
