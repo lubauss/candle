@@ -22,7 +22,9 @@ pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
 pub use fill::*;
 pub use gather_mm::{call_gather_mm, call_gather_mm_with_kernel, GatherMmKernel};
-pub use gather_qmm::{call_gather_qmm, call_gather_qmm_with_kernel, GatherQmmKernel};
+pub use gather_qmm::{
+    call_gather_qmm, call_gather_qmm_parallel, call_gather_qmm_with_kernel, GatherQmmKernel,
+};
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, GemmDType};
 pub use quantized::{
