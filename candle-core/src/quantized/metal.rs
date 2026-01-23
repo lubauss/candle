@@ -585,21 +585,85 @@ impl QMetalStorage {
         // Total number of output rows (token, expert_slot pairs)
         let total_rows = nei0 * nei1;
 
-        // Threshold for using new gather_qmm kernel vs old kernel_mul_mm_id
+        // Debug: always print kernel selection info
+        eprintln!(
+            "[DEBUG fwd_with_ids] dtype={:?} nei0={} nei1={} total_rows={} broadcast_input={}",
+            self.dtype, nei0, nei1, total_rows, broadcast_input
+        );
+
+        // Threshold for using new gather_qmm kernels vs old kernel_mul_mm_id
         // The old kernel uses threadgroup memory: 8 experts × max_tokens × 4 bytes
         // Metal threadgroup limit is 32KB, so max_tokens ≈ 1024 before overflow
         // We use 768 as a safe threshold (leaves room for other threadgroup usage)
         const MAX_ROWS_FOR_OLD_KERNEL: usize = 768;
 
-        // Use new gather_qmm kernel for Q4K with large token counts to avoid threadgroup overflow
-        // The new kernel stores indices in device memory (unlimited) instead of threadgroup (32KB limit)
-        let use_gather_qmm = matches!(self.dtype, GgmlDType::Q4K)
+        // Use new gather_qmm kernels for Q4K with large token counts to avoid threadgroup overflow
+        // The new kernels store indices in device memory (unlimited) instead of threadgroup (32KB limit)
+        //
+        // Parallel kernel supports broadcast input (reads input[token, :] for all expert slots)
+        // Simple kernel requires non-broadcast input (nei0 == 1)
+        let use_parallel_dispatch = matches!(self.dtype, GgmlDType::Q4K)
             && total_rows > MAX_ROWS_FOR_OLD_KERNEL
-            && nei0 == 1  // Only support simple case initially (one expert per token)
+            && nei0 > 1
+            && broadcast_input; // Parallel kernel handles broadcast mode efficiently
+
+        let use_simple_gather_qmm = matches!(self.dtype, GgmlDType::Q4K)
+            && total_rows > MAX_ROWS_FOR_OLD_KERNEL
+            && nei0 == 1
             && !broadcast_input;
 
-        if use_gather_qmm {
-            // Use new gather_qmm kernel (device memory indices, no overflow)
+        if use_parallel_dispatch {
+            // Use parallel gather_qmm kernel for top-k experts
+            //
+            // This kernel processes ALL top-k experts in parallel using 3D dispatch:
+            // Grid: (col_tiles, num_tokens, top_k)
+            //
+            // Key optimization: All 8 experts (for Qwen3-30B) are computed simultaneously
+            // instead of sequentially, maximizing GPU utilization.
+            //
+            // The parallel gather_qmm kernel expects:
+            // - weights: [num_experts, N, K/block_size] quantized blocks
+            // - input: [M, K] float activations (M = num_tokens)
+            // - indices: [M, top_k] uint32 expert indices
+            // - output: [M, top_k, N] float
+
+            candle_metal_kernels::call_gather_qmm_parallel(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                (nei1, n, k, num_experts, nei0), // (num_tokens, n, k, num_experts, top_k)
+                &self.buffer,
+                0,
+                storage.buffer(),
+                layout.start_offset() * storage.dtype().size_in_bytes(),
+                ids.buffer(),
+                ids_layout.start_offset() * std::mem::size_of::<i32>(),
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+
+            // Profile kernel execution if enabled
+            if profiling {
+                if let Some(start) = start {
+                    device.wait_until_completed()?;
+                    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!(
+                        "[METAL PROFILE] GATHER_QMM_PARALLEL,{:?},{},{},{},{:.4}ms,experts={},top_k={},tokens={}",
+                        self.dtype, nei1, n, k, elapsed, num_experts, nei0, nei1
+                    );
+                } else {
+                    let count = KERNEL_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count % 100 == 0 {
+                        eprintln!(
+                            "[METAL PROFILE] GATHER_QMM_PARALLEL,{:?},{},{},{},call#{},experts={},top_k={},tokens={}",
+                            self.dtype, nei1, n, k, count, num_experts, nei0, nei1
+                        );
+                    }
+                }
+            }
+        } else if use_simple_gather_qmm {
+            // Use simple gather_qmm kernel (single expert per token)
             //
             // This kernel is designed for large image inputs that generate 5000+ tokens,
             // which would overflow the 32KB threadgroup memory limit in the old kernel.
@@ -610,8 +674,6 @@ impl QMetalStorage {
             // - indices: [M] uint32 expert indices
             // - output: [M, N] float
 
-            // Convert i32 indices to u32 by reinterpreting the buffer
-            // The Metal kernel will read them as uint32_t
             candle_metal_kernels::call_gather_qmm(
                 device.device(),
                 &encoder,

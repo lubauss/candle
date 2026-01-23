@@ -448,6 +448,145 @@ void gather_qmm_q4_K_simd(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Parameters structure for parallel expert dispatch (top-k experts per token)
+///////////////////////////////////////////////////////////////////////////////
+
+struct GatherQmmParallelParams {
+    int M;                    // Number of tokens
+    int N;                    // Output features per expert
+    int K;                    // Input features (hidden dim)
+    int num_experts;          // Total number of experts
+    int top_k;                // Number of experts per token
+    int blocks_per_row;       // Number of quantized blocks per weight row
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Parallel expert dispatch kernel for Q4_K
+//
+// This kernel processes ALL top-k experts for each token in parallel using
+// 3D dispatch: (col_tiles, num_tokens, top_k).
+//
+// Each threadgroup handles one (token, expert_slot) pair's output tile.
+// Output is [M * top_k, N] which reshapes to [M, top_k, N].
+//
+// Key optimization: All 8 experts (for Qwen3-30B) process simultaneously
+// instead of sequentially, maximizing GPU utilization.
+///////////////////////////////////////////////////////////////////////////////
+
+[[kernel, host_name("gather_qmm_q4_K_parallel")]]
+void gather_qmm_q4_K_parallel(
+    device const block_q4_K * weights      [[buffer(0)]],  // [num_experts, N, K/256] blocks
+    device const float      * input        [[buffer(1)]],  // [M, K] float activations
+    device       float      * output       [[buffer(2)]],  // [M, top_k, N] float output
+    device const uint32_t   * indices      [[buffer(3)]],  // [M, top_k] expert indices
+    constant GatherQmmParallelParams& params [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],           // (col_tile, token, expert_slot)
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+
+    const int col_block = tgid.x * 128;  // Each threadgroup handles 128 columns
+    const int token = tgid.y;            // Token index [0, M)
+    const int expert_slot = tgid.z;      // Expert slot [0, top_k)
+
+    if (token >= params.M) {
+        return;
+    }
+
+    // Get expert index for this (token, expert_slot) pair
+    const uint32_t expert = indices[token * params.top_k + expert_slot];
+
+    const int K = params.K;
+    const int N = params.N;
+
+    // Each simdgroup handles 32 columns
+    const int col = col_block + simd_group_id * 32 + simd_lane_id;
+
+    // Output index: flatten [M, top_k, N] -> row-major
+    const int output_row = token * params.top_k + expert_slot;
+
+    if (col >= N || expert >= uint32_t(params.num_experts)) {
+        if (col < N) {
+            output[output_row * N + col] = 0.0f;
+        }
+        return;
+    }
+
+    const int blocks_per_expert_row = K / QK_K;
+    const int blocks_per_expert = N * blocks_per_expert_row;
+
+    device const block_q4_K * expert_weights = weights + expert * blocks_per_expert;
+    device const block_q4_K * col_weights = expert_weights + col * blocks_per_expert_row;
+    device const float * input_row = input + token * K;
+
+    float acc = 0.0f;
+
+    // Process each Q4_K block
+    for (int block_idx = 0; block_idx < blocks_per_expert_row; block_idx++) {
+        device const block_q4_K * b = col_weights + block_idx;
+        const int k_base = block_idx * QK_K;
+
+        const float d = float(b->dm.x);
+        const float dmin = float(b->dm.y);
+
+        // Process 8 groups of 32 values
+        for (int group = 0; group < 8; group++) {
+            int is = group;
+            uchar2 sc;
+            if (is < 4) {
+                sc = uchar2{uchar(b->scales[is] & 63), uchar(b->scales[is + 4] & 63)};
+            } else {
+                sc = uchar2{
+                    uchar((b->scales[is + 4] & 0xF) | ((b->scales[is - 4] & 0xc0) >> 2)),
+                    uchar((b->scales[is + 4] >> 4) | ((b->scales[is] & 0xc0) >> 2))
+                };
+            }
+
+            const float scale = d * float(sc[0]);
+            const float min_val = dmin * float(sc[1]);
+
+            // Vectorized processing of 32 values
+            const int q_offset = group * 16;
+            const int k_group = k_base + group * 32;
+
+            // Process 8 values at a time using float4
+            for (int i = 0; i < 32; i += 4) {
+                if (k_group + i + 3 >= K) {
+                    // Handle remainder
+                    for (int r = i; r < 32 && k_group + r < K; r++) {
+                        const int byte_idx = q_offset + r / 2;
+                        uint8_t q = b->qs[byte_idx];
+                        q = (r % 2 == 0) ? (q & 0x0F) : (q >> 4);
+                        acc += (scale * float(q) - min_val) * input_row[k_group + r];
+                    }
+                    break;
+                }
+
+                // Extract 4 quantized values
+                float4 weights_vec;
+                for (int v = 0; v < 4; v++) {
+                    const int byte_idx = q_offset + (i + v) / 2;
+                    uint8_t q = b->qs[byte_idx];
+                    q = ((i + v) % 2 == 0) ? (q & 0x0F) : (q >> 4);
+                    weights_vec[v] = scale * float(q) - min_val;
+                }
+
+                // Load input values
+                float4 input_vec = float4(
+                    input_row[k_group + i],
+                    input_row[k_group + i + 1],
+                    input_row[k_group + i + 2],
+                    input_row[k_group + i + 3]
+                );
+
+                acc += dot(weights_vec, input_vec);
+            }
+        }
+    }
+
+    output[output_row * N + col] = acc;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Kernel instantiations (only for templated kernels)
 ///////////////////////////////////////////////////////////////////////////////
 
